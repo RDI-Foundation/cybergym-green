@@ -24,16 +24,28 @@ def main():
     # See: https://a2a-protocol.org/latest/tutorials/python/3-agent-skills-and-card/
     
     skill = AgentSkill(
-        id="",
-        name="",
-        description="",
-        tags=[],
-        examples=[]
+        id="cybergym",
+        name="CyberGym",
+        description="Runs a CyberGym task.",
+        tags=["cybersecurity", "vulnerability", "exploit", "ctf"],
+        examples=[
+            """
+                {
+                    "participants": {"agent": "http://localhost:8000/"},
+                    "config": {
+                        "task": "arvo:12345",
+                        "level": "level1",
+                        "vul_test_url": "http://cybergym-vulnerable:1337/",
+                        "fix_test_url": "http://cybergym-fixed:1337/"
+                    }
+                }
+            """
+        ]
     )
 
     agent_card = AgentCard(
-        name="",
-        description="",
+        name="CyberGym Green",
+        description="Green agent for the CyberGym benchmark.",
         url=args.card_url or f"http://{args.host}:{args.port}/",
         version='1.0.0',
         default_input_modes=['text'],
