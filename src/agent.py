@@ -1,5 +1,6 @@
 import base64
 import json
+import os
 from pathlib import Path
 from typing import Any
 from pydantic import BaseModel, HttpUrl, ValidationError
@@ -74,11 +75,22 @@ class Agent:
     # Fill in: list of required participant roles, e.g. ["pro_debater", "con_debater"]
     required_roles: list[str] = ["agent"]
     # Fill in: list of required config keys, e.g. ["topic", "num_rounds"]
-    required_config_keys: list[str] = ["task", "level", "vul_test_url", "fix_test_url"]
+    required_config_keys: list[str] = []
 
     def __init__(self):
         self.messenger = Messenger()
         # Initialize other state here
+        task = os.environ.get("TASK")
+        vul_url = os.environ.get("VUL_EXECUTOR_URL")
+        fix_url = os.environ.get("FIX_EXECUTOR_URL")
+        if not task:
+            raise RuntimeError("TASK environment variable must be set")
+        if not vul_url or not fix_url:
+            raise RuntimeError("VUL_EXECUTOR_URL and FIX_EXECUTOR_URL environment variables must be set")
+        self.task_id: str = task
+        self.vul_url: str = vul_url
+        self.fix_url: str = fix_url
+        self.all_task_files: dict[str, bytes] = self._download_all_task_files(task)
 
     def validate_request(self, request: EvalRequest) -> tuple[bool, str]:
         missing_roles = set(self.required_roles) - set(request.participants.keys())
@@ -90,14 +102,14 @@ class Agent:
             return False, f"Missing config keys: {missing_config_keys}"
 
         # Add additional request validation here
-        level = request.config.get("level")
+        level = request.config.get("level", "level1")
         if level not in LEVEL_FILES:
             return False, f"Unknown level: {level!r}. Must be one of: {list(LEVEL_FILES)}"
 
         return True, "ok"
 
-    def _download_task_files(self, task_id: str, level: str) -> dict[str, bytes]:
-        """Download task files from HuggingFace and return {filename: bytes}."""
+    def _download_all_task_files(self, task_id: str) -> dict[str, bytes]:
+        """Download all task files from HuggingFace and return {filename: bytes}."""
         from huggingface_hub import \
             hf_hub_download  # type: ignore[import-untyped]
 
@@ -107,10 +119,10 @@ class Agent:
         else:
             raise ValueError(f"Invalid task_id format: {task_id!r}. Expected 'category:number'")
 
-        files_needed = LEVEL_FILES[level]
+        all_files = set(f for files in LEVEL_FILES.values() for f in files)
         result: dict[str, bytes] = {}
 
-        for filename in files_needed:
+        for filename in all_files:
             hf_path = f"data/{category}/{task_num}/{filename}"
             local_path: str = hf_hub_download(
                 repo_id=HF_DATASET,
@@ -126,10 +138,13 @@ class Agent:
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(
                 url,
-                files={"file": ("poc.bin", poc_bytes, "application/octet-stream")},
+                content=poc_bytes,
+                headers={"Content-Type": "application/octet-stream"},
             )
-            response.raise_for_status()
-            return response.json()
+            try:
+                return response.json()
+            except Exception:
+                return {"error": f"HTTP {response.status_code}: {response.text}"}
 
     async def run(self, message: Message, updater: TaskUpdater) -> None:
         """Implement your agent logic here.
@@ -156,23 +171,13 @@ class Agent:
         # Use request.participants to get participant agent URLs by role
         # Use request.config for assessment parameters
         config = request.config
-        task_id: str = config["task"]
-        level: str = config["level"]
-        vul_test_url: str = str(config["vul_test_url"])
-        fix_test_url: str = str(config["fix_test_url"])
+        level: str = config.get("level", "level1")
         agent_url: str = str(request.participants["agent"])
 
-        await updater.update_status(
-            TaskState.working,
-            new_agent_text_message(f"Downloading task files for {task_id} at {level}...")
-        )
-
-        # Step 1: Download task files
-        try:
-            task_files = self._download_task_files(task_id, level)
-        except Exception as e:
-            await updater.failed(new_agent_text_message(f"Failed to download task files: {e}"))
-            return
+        # Step 1: Select task files for the requested level
+        task_files: dict[str, bytes] = {
+            name: self.all_task_files[name] for name in LEVEL_FILES[level]
+        }
 
         # Step 2: Build initial message with README.md and task file attachments
         files_description = "\n".join(
@@ -213,8 +218,8 @@ class Agent:
             result = await self._converse_with_agent(
                 agent_url=agent_url,
                 initial_msg=initial_msg,
-                vul_test_url=vul_test_url,
-                fix_test_url=fix_test_url,
+                vul_test_url=self.vul_url,
+                fix_test_url=self.fix_url,
                 updater=updater,
             )
         except Exception as e:

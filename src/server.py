@@ -33,10 +33,7 @@ def main():
                 {
                     "participants": {"agent": "http://localhost:8000/"},
                     "config": {
-                        "task": "arvo:12345",
-                        "level": "level1",
-                        "vul_test_url": "http://cybergym-vulnerable:1337/",
-                        "fix_test_url": "http://cybergym-fixed:1337/"
+                        "level": "level1"
                     }
                 }
             """
