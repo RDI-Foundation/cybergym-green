@@ -1,7 +1,12 @@
+import asyncio
 import base64
+import io
 import json
-import os
+import tarfile
 from pathlib import Path
+
+import docker as docker_sdk
+
 from typing import Any
 from pydantic import BaseModel, HttpUrl, ValidationError
 from uuid import uuid4
@@ -65,6 +70,58 @@ Please submit the PoC file by sending a status update message with two parts:
 """
 
 
+def _task_images_and_command(task_id: str) -> tuple[str, str, str]:
+    """Return (vul_image, fix_image, executor_command) for a given task ID."""
+    if ":" in task_id:
+        category, task_num = task_id.split(":", 1)
+    else:
+        raise ValueError(f"Invalid task_id format: {task_id!r}. Expected 'category:number'")
+
+    if category == "arvo":
+        return (
+            f"n132/arvo:{task_num}-vul",
+            f"n132/arvo:{task_num}-fix",
+            "/bin/arvo",
+        )
+    elif category == "oss-fuzz":
+        # TODO: confirm oss-fuzz image naming and executor command
+        return (
+            f"cybergym/oss-fuzz:{task_num}-vul",
+            f"cybergym/oss-fuzz:{task_num}-fix",
+            "run_poc",
+        )
+    else:
+        raise NotImplementedError(f"Unknown task category: {category!r}")
+
+
+def _make_poc_tar(poc_bytes: bytes) -> bytes:
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        info = tarfile.TarInfo(name="poc")
+        info.size = len(poc_bytes)
+        tar.addfile(info, io.BytesIO(poc_bytes))
+    return buf.getvalue()
+
+
+def _pull_image(image: str) -> None:
+    docker_sdk.from_env().images.pull(image)
+
+
+def _run_poc_in_container(image: str, command: str, poc_bytes: bytes) -> dict[str, Any]:
+    """Run a PoC file through a docker container and return exit_code + output."""
+    client = docker_sdk.from_env()
+    container = client.containers.create(image, command=command)
+    try:
+        # Can't put poc on docker host for volume mount, so use put_archive instead.
+        container.put_archive("/tmp", _make_poc_tar(poc_bytes))
+        container.start()
+        exit_code = container.wait()["StatusCode"]
+        output = container.logs(stdout=True, stderr=True).decode(errors="replace")
+        return {"exit_code": exit_code, "output": output}
+    finally:
+        container.remove()
+
+
 class EvalRequest(BaseModel):
     """Request format sent by the AgentBeats platform to green agents."""
     participants: dict[str, HttpUrl] # role -> agent URL
@@ -75,22 +132,10 @@ class Agent:
     # Fill in: list of required participant roles, e.g. ["pro_debater", "con_debater"]
     required_roles: list[str] = ["agent"]
     # Fill in: list of required config keys, e.g. ["topic", "num_rounds"]
-    required_config_keys: list[str] = []
+    required_config_keys: list[str] = ["task"]
 
     def __init__(self):
         self.messenger = Messenger()
-        # Initialize other state here
-        task = os.environ.get("TASK")
-        vul_url = os.environ.get("VUL_EXECUTOR_URL")
-        fix_url = os.environ.get("FIX_EXECUTOR_URL")
-        if not task:
-            raise RuntimeError("TASK environment variable must be set")
-        if not vul_url or not fix_url:
-            raise RuntimeError("VUL_EXECUTOR_URL and FIX_EXECUTOR_URL environment variables must be set")
-        self.task_id: str = task
-        self.vul_url: str = vul_url
-        self.fix_url: str = fix_url
-        self.all_task_files: dict[str, bytes] = self._download_all_task_files(task)
 
     def validate_request(self, request: EvalRequest) -> tuple[bool, str]:
         missing_roles = set(self.required_roles) - set(request.participants.keys())
@@ -108,8 +153,8 @@ class Agent:
 
         return True, "ok"
 
-    def _download_all_task_files(self, task_id: str) -> dict[str, bytes]:
-        """Download all task files from HuggingFace and return {filename: bytes}."""
+    def _download_task_files(self, task_id: str, filenames: list[str]) -> dict[str, bytes]:
+        """Download the given task files from HuggingFace and return {filename: bytes}."""
         from huggingface_hub import \
             hf_hub_download  # type: ignore[import-untyped]
 
@@ -119,10 +164,8 @@ class Agent:
         else:
             raise ValueError(f"Invalid task_id format: {task_id!r}. Expected 'category:number'")
 
-        all_files = set(f for files in LEVEL_FILES.values() for f in files)
         result: dict[str, bytes] = {}
-
-        for filename in all_files:
+        for filename in filenames:
             hf_path = f"data/{category}/{task_num}/{filename}"
             local_path: str = hf_hub_download(
                 repo_id=HF_DATASET,
@@ -132,19 +175,6 @@ class Agent:
             result[filename] = Path(local_path).read_bytes()
 
         return result
-
-    async def _post_poc(self, url: str, poc_bytes: bytes) -> dict[str, Any]:
-        """POST a PoC file to a validation server endpoint."""
-        async with httpx.AsyncClient(timeout=60) as client:
-            response = await client.post(
-                url,
-                content=poc_bytes,
-                headers={"Content-Type": "application/octet-stream"},
-            )
-            try:
-                return response.json()
-            except Exception:
-                return {"error": f"HTTP {response.status_code}: {response.text}"}
 
     async def run(self, message: Message, updater: TaskUpdater) -> None:
         """Implement your agent logic here.
@@ -171,13 +201,31 @@ class Agent:
         # Use request.participants to get participant agent URLs by role
         # Use request.config for assessment parameters
         config = request.config
+        task_id: str = config["task"]
         level: str = config.get("level", "level1")
         agent_url: str = str(request.participants["agent"])
 
-        # Step 1: Select task files for the requested level
-        task_files: dict[str, bytes] = {
-            name: self.all_task_files[name] for name in LEVEL_FILES[level]
-        }
+        try:
+            vul_image, fix_image, executor_command = _task_images_and_command(task_id)
+        except (ValueError, NotImplementedError) as e:
+            await updater.reject(new_agent_text_message(str(e)))
+            return
+
+        # Step 1: Download task files for the requested level
+        await updater.update_status(
+            TaskState.working,
+            new_agent_text_message("Downloading task files...")
+        )
+        task_files: dict[str, bytes] = await asyncio.to_thread(self._download_task_files, task_id, LEVEL_FILES[level])
+
+        await updater.update_status(
+            TaskState.working,
+            new_agent_text_message("Pulling Docker images...")
+        )
+        await asyncio.gather(
+            asyncio.to_thread(_pull_image, vul_image),
+            asyncio.to_thread(_pull_image, fix_image),
+        )
 
         # Step 2: Build initial message with README.md and task file attachments
         files_description = "\n".join(
@@ -218,8 +266,9 @@ class Agent:
             result = await self._converse_with_agent(
                 agent_url=agent_url,
                 initial_msg=initial_msg,
-                vul_test_url=self.vul_url,
-                fix_test_url=self.fix_url,
+                vul_image=vul_image,
+                fix_image=fix_image,
+                executor_command=executor_command,
                 updater=updater,
             )
         except Exception as e:
@@ -238,8 +287,9 @@ class Agent:
         self,
         agent_url: str,
         initial_msg: Message,
-        vul_test_url: str,
-        fix_test_url: str,
+        vul_image: str,
+        fix_image: str,
+        executor_command: str,
         updater: TaskUpdater,
     ) -> dict[str, Any]:
         """Stream events from the benchmarked agent, handling PoC test requests inline."""
@@ -268,7 +318,7 @@ class Agent:
                                     new_agent_text_message("Testing PoC against vulnerable version...")
                                 )
                                 try:
-                                    reply_data = await self._post_poc(vul_test_url, test_bytes)
+                                    reply_data = await asyncio.to_thread(_run_poc_in_container, vul_image, executor_command, test_bytes)  # type: ignore[arg-type]
                                 except Exception as e:
                                     reply_data = {"error": str(e)}
 
@@ -307,14 +357,14 @@ class Agent:
         )
 
         try:
-            vuln_result = await self._post_poc(vul_test_url, poc_bytes)
+            vuln_result = await asyncio.to_thread(_run_poc_in_container, vul_image, executor_command, poc_bytes)
             vuln_exit: int = vuln_result.get("exit_code", 0)
         except Exception as e:
             vuln_result = {"error": str(e)}
             vuln_exit = 0
 
         try:
-            fixed_result = await self._post_poc(fix_test_url, poc_bytes)
+            fixed_result = await asyncio.to_thread(_run_poc_in_container, fix_image, executor_command, poc_bytes)
             fixed_exit: int = fixed_result.get("exit_code", 0)
         except Exception as e:
             fixed_result = {"error": str(e)}
