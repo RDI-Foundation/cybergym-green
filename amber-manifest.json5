@@ -17,24 +17,43 @@
     proxy: { kind: "a2a" },
   },
 
-  // Amber doesn't have a way to bind a framework capability to self, so put
-  // the program into a child component.
-  components: {
-    program: {
-      manifest: "./amber-manifest-program.json5",
-      config: {},
+  // Runtime configuration
+  program: {
+    // TODO: Replace with your docker image
+    image: "cybergym-green:latest",
+    entrypoint: "uv run python src/server.py --host 0.0.0.0 --port 9009",
+
+    // TODO: Pass config values as environment variables
+    env: {
+      PYTHONUNBUFFERED: "1",
+      // Amber uses a helper to create this socket and proxy the communication
+      // to the daemon. Our container runs as not root, so it wouldn't be able
+      // to create this socket in the usual /var/run/docker.sock.
+      DOCKER_HOST: "unix:///tmp/docker.sock",
+      // We'll receive participant URLs over A2A, but we need to include the
+      // slot URL somewhere in the program in order for Amber to allow us to
+      // connect. Here we're putting it in an unused environment variable.
+      AMBER_HINT_PROXY: "${slots.proxy}",
+    },
+
+    mounts: [
+      { path: "/tmp/docker.sock", from: "framework.docker" },
+    ],
+
+    network: {
+      endpoints: [
+        { name: "a2a_endpoint", port: 9009 }, // ensure port matches your entrypoint
+      ],
     },
   },
 
-  bindings: [
-    { to: "#program.proxy", from: "slots.proxy" },
-    { to: "#program.docker", from: "framework.docker" },
-  ],
+  // Capabilities provided by this agent
+  provides: {
+    a2a: { kind: "a2a", endpoint: "a2a_endpoint" },
+  },
 
   // Capabilities exposed to the scenario
-  exports: {
-    a2a: "#program.a2a",
-  },
+  exports: { a2a: "a2a" },
 
   // TODO: Describe the assessment request your green agent receives
   metadata: {
