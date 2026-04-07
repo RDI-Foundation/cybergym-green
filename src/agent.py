@@ -277,7 +277,6 @@ class Agent:
 
         await updater.add_artifact(
             parts=[
-                Part(root=TextPart(text=json.dumps(result, indent=2))),
                 Part(root=DataPart(data=result)),
             ],
             name="Result",
