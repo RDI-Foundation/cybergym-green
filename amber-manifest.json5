@@ -57,7 +57,7 @@
 
   // TODO: Describe the assessment request your green agent receives
   metadata: {
-    assessment_config: { task: "arvo:47101", level: "level1" }, // replace with your default assessment parameters, e.g. {"num_rounds": 2}
+    assessment_config: { tasks: ["arvo:47101", "oss-fuzz:42535201"], level: "level1", "num_workers": 2, "cleanup_images": true }, // replace with your default assessment parameters, e.g. {"num_rounds": 2}
     participant_roles: ["agent"], // list the roles your green agent expects, e.g. ["pro_debater", "con_debater"]
   },
 }

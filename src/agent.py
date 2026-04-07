@@ -6,6 +6,7 @@ import tarfile
 from pathlib import Path
 
 import docker as docker_sdk
+from docker.errors import ImageNotFound
 
 from typing import Any
 from pydantic import BaseModel, HttpUrl, ValidationError
@@ -107,6 +108,13 @@ def _pull_image(image: str) -> None:
     docker_sdk.from_env().images.pull(image)
 
 
+def _remove_image(image: str) -> None:
+    try:
+        docker_sdk.from_env().images.remove(image)
+    except ImageNotFound:
+        pass
+
+
 def _run_poc_in_container(image: str, command: str, poc_bytes: bytes) -> dict[str, Any]:
     """Run a PoC file through a docker container and return exit_code + output."""
     client = docker_sdk.from_env()
@@ -132,7 +140,7 @@ class Agent:
     # Fill in: list of required participant roles, e.g. ["pro_debater", "con_debater"]
     required_roles: list[str] = ["agent"]
     # Fill in: list of required config keys, e.g. ["topic", "num_rounds"]
-    required_config_keys: list[str] = ["task"]
+    required_config_keys: list[str] = ["tasks"]
 
     def __init__(self):
         self.messenger = Messenger()
@@ -201,26 +209,73 @@ class Agent:
         # Use request.participants to get participant agent URLs by role
         # Use request.config for assessment parameters
         config = request.config
-        task_id: str = config["task"]
-        level: str = config.get("level", "level1")
+        tasks: list[str] = config["tasks"]
+        num_shards: int = config.get("num_shards", 1)
+        shard_index: int = config.get("shard_index", 0)
+        num_workers: int = config.get("num_workers", 2)
+        cleanup_images: bool = config.get("cleanup_images", False)
         agent_url: str = str(request.participants["agent"])
 
-        try:
-            vul_image, fix_image, executor_command = _task_images_and_command(task_id)
-        except (ValueError, NotImplementedError) as e:
-            await updater.reject(new_agent_text_message(str(e)))
-            return
+        shard_tasks = tasks[shard_index::num_shards]
+        level: str = config.get("level", "level1")
+        work_queue: asyncio.Queue[str] = asyncio.Queue()
+        for task_id in shard_tasks:
+            work_queue.put_nowait(task_id)
+
+        results: dict[str, Any] = {}
+
+        async def run_worker() -> None:
+            while True:
+                try:
+                    task_id = work_queue.get_nowait()
+                except asyncio.QueueEmpty:
+                    break
+                try:
+                    results[task_id] = await self._run_single_task(
+                        task_id=task_id,
+                        level=level,
+                        agent_url=agent_url,
+                        updater=updater,
+                        cleanup_images=cleanup_images,
+                    )
+                except Exception as e:
+                    results[task_id] = {"error": str(e)}
+                done = len(results)
+                await updater.update_status(
+                    TaskState.working,
+                    new_agent_text_message(f"[{task_id}] Done ({done}/{len(shard_tasks)})")
+                )
+
+        await asyncio.gather(*[run_worker() for _ in range(num_workers)])
+
+        await updater.add_artifact(
+            parts=[
+                Part(root=DataPart(data=results)),
+            ],
+            name="Result",
+        )
+
+    async def _run_single_task(
+        self,
+        task_id: str,
+        level: str,
+        agent_url: str,
+        updater: TaskUpdater,
+        cleanup_images: bool = False,
+    ) -> dict[str, Any]:
+        """Run one task: download files, build the initial message, converse, and return the result."""
+        vul_image, fix_image, executor_command = _task_images_and_command(task_id)
 
         # Step 1: Download task files for the requested level
         await updater.update_status(
             TaskState.working,
-            new_agent_text_message("Downloading task files...")
+            new_agent_text_message(f"[{task_id}] Downloading task files...")
         )
         task_files: dict[str, bytes] = await asyncio.to_thread(self._download_task_files, task_id, LEVEL_FILES[level])
 
         await updater.update_status(
             TaskState.working,
-            new_agent_text_message("Pulling Docker images...")
+            new_agent_text_message(f"[{task_id}] Pulling Docker images...")
         )
         await asyncio.gather(
             asyncio.to_thread(_pull_image, vul_image),
@@ -258,33 +313,33 @@ class Agent:
 
         await updater.update_status(
             TaskState.working,
-            new_agent_text_message("Sending task to agent...")
+            new_agent_text_message(f"[{task_id}] Sending task to agent...")
         )
 
         # Step 3: Stream conversation with the benchmarked agent
         try:
-            result = await self._converse_with_agent(
+            return await self._converse_with_agent(
                 agent_url=agent_url,
+                task_id=task_id,
                 initial_msg=initial_msg,
                 vul_image=vul_image,
                 fix_image=fix_image,
                 executor_command=executor_command,
                 updater=updater,
             )
-        except Exception as e:
-            await updater.failed(new_agent_text_message(f"Error during evaluation: {e}"))
-            return
-
-        await updater.add_artifact(
-            parts=[
-                Part(root=DataPart(data=result)),
-            ],
-            name="Result",
-        )
+        finally:
+            if cleanup_images:
+                await asyncio.gather(
+                    asyncio.to_thread(_remove_image, vul_image),
+                    asyncio.to_thread(_remove_image, fix_image),
+                )
+            # Note: hf_hub_download caches files to disk. With many tasks this can add up;
+            # consider periodically clearing the HF cache (~/.cache/huggingface/hub).
 
     async def _converse_with_agent(
         self,
         agent_url: str,
+        task_id: str,
         initial_msg: Message,
         vul_image: str,
         fix_image: str,
@@ -314,7 +369,7 @@ class Agent:
                             else:
                                 await updater.update_status(
                                     TaskState.working,
-                                    new_agent_text_message("Testing PoC against vulnerable version...")
+                                    new_agent_text_message(f"[{task_id}] Testing PoC against vulnerable version...")
                                 )
                                 try:
                                     reply_data = await asyncio.to_thread(_run_poc_in_container, vul_image, executor_command, test_bytes)  # type: ignore[arg-type]
@@ -352,7 +407,7 @@ class Agent:
         # Score the final submission against both versions
         await updater.update_status(
             TaskState.working,
-            new_agent_text_message("Scoring final submission against vulnerable and fixed versions...")
+            new_agent_text_message(f"[{task_id}] Scoring final submission against vulnerable and fixed versions...")
         )
 
         try:
