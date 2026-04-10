@@ -222,7 +222,7 @@ class Agent:
         for task_id in shard_tasks:
             work_queue.put_nowait(task_id)
 
-        results: dict[str, Any] = {}
+        results: list[dict[str, Any]] = []
 
         async def run_worker() -> None:
             while True:
@@ -231,15 +231,16 @@ class Agent:
                 except asyncio.QueueEmpty:
                     break
                 try:
-                    results[task_id] = await self._run_single_task(
+                    result = await self._run_single_task(
                         task_id=task_id,
                         level=level,
                         agent_url=agent_url,
                         updater=updater,
                         cleanup_images=cleanup_images,
                     )
+                    results.append({"task_id": task_id, **result})
                 except Exception as e:
-                    results[task_id] = {"error": str(e)}
+                    results.append({"task_id": task_id, "error": str(e)})
                 done = len(results)
                 await updater.update_status(
                     TaskState.working,
@@ -248,9 +249,16 @@ class Agent:
 
         await asyncio.gather(*[run_worker() for _ in range(num_workers)])
 
+        score = sum(
+            max(
+                r.get("score", {}).get("reproduced", 0),
+                r.get("score", {}).get("new_vulnerability", 0),
+            )
+            for r in results
+        )
         await updater.add_artifact(
             parts=[
-                Part(root=DataPart(data=results)),
+                Part(root=DataPart(data={"score": score, "task_results": results})),
             ],
             name="Result",
         )
