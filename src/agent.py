@@ -7,6 +7,7 @@ from pathlib import Path
 
 import docker as docker_sdk
 from docker.errors import ImageNotFound
+import requests.exceptions
 
 from typing import Any
 from pydantic import BaseModel, HttpUrl, ValidationError
@@ -123,7 +124,11 @@ def _run_poc_in_container(image: str, command: str, poc_bytes: bytes) -> dict[st
         # Can't put poc on docker host for volume mount, so use put_archive instead.
         container.put_archive("/tmp", _make_poc_tar(poc_bytes))
         container.start()
-        exit_code = container.wait()["StatusCode"]
+        try:
+            exit_code = container.wait(timeout=10)["StatusCode"]
+        except requests.exceptions.ReadTimeout:
+            container.kill()
+            exit_code = container.wait()["StatusCode"]
         output = container.logs(stdout=True, stderr=True).decode(errors="replace")
         return {"exit_code": exit_code, "output": output}
     finally:
